@@ -362,13 +362,33 @@ class WidthVisitor final : public VNVisitor {
     // Signed: If both sides real
     void visit(AstAdd* nodep) override { visit_add_sub_replace(nodep, true); }
     void visit(AstSub* nodep) override { visit_add_sub_replace(nodep, true); }
-    void visit(AstDiv* nodep) override { visit_add_sub_replace(nodep, true); }
+    void visit(AstDiv* nodep) override {
+        if (!m_paramsOnly) {
+            nodep->v3warn(UNSYNTHESIZABLE, "Operator '/' is not synthesizable");
+        }
+        visit_add_sub_replace(nodep, true);
+    }
     void visit(AstMul* nodep) override { visit_add_sub_replace(nodep, true); }
     // These can't promote to real
-    void visit(AstModDiv* nodep) override { visit_add_sub_replace(nodep, false); }
-    void visit(AstModDivS* nodep) override { visit_add_sub_replace(nodep, false); }
+    void visit(AstModDiv* nodep) override {
+        if (!m_paramsOnly) {
+            nodep->v3warn(UNSYNTHESIZABLE, "Operator '%' (modulo) is not synthesizable");
+        }
+        visit_add_sub_replace(nodep, false);
+    }
+    void visit(AstModDivS* nodep) override {
+        if (!m_paramsOnly) {
+            nodep->v3warn(UNSYNTHESIZABLE, "Operator '%' (signed modulo) is not synthesizable");
+        }
+        visit_add_sub_replace(nodep, false);
+    }
     void visit(AstMulS* nodep) override { visit_add_sub_replace(nodep, false); }
-    void visit(AstDivS* nodep) override { visit_add_sub_replace(nodep, false); }
+    void visit(AstDivS* nodep) override {
+        if (!m_paramsOnly) {
+            nodep->v3warn(UNSYNTHESIZABLE, "Operator '/' (signed division) is not synthesizable");
+        }
+        visit_add_sub_replace(nodep, false);
+    }
     // Widths: out width = lhs width, but upper matters
     // Signed: Output signed iff LHS signed; unary operator
     // Unary promote to real
@@ -1709,6 +1729,9 @@ class WidthVisitor final : public VNVisitor {
         // RHS is self-determined (IEEE)
         // Real if either side is real (as with AstAdd)
         assertAtExpr(nodep);
+        if (!m_paramsOnly) {
+            nodep->v3warn(UNSYNTHESIZABLE, "Operator '**' (power) is not synthesizable");
+        }
         if (m_vup->prelim()) {
             userIterateAndNext(nodep->lhsp(), WidthVP{CONTEXT_DET, PRELIM}.p());
             userIterateAndNext(nodep->rhsp(), WidthVP{CONTEXT_DET, PRELIM}.p());
@@ -2796,6 +2819,15 @@ class WidthVisitor final : public VNVisitor {
         userIterateAndNext(nodep->delayp(), WidthVP{nodep->dtypep(), PRELIM}.p());
         UINFO(4, "varWidthed " << nodep);
         // UINFOTREE(1, nodep, "", "InitOut");
+        // Check for unsupported unpacked array on interface ports only
+        // (synthesis tools pack these, causing GLS mismatches)
+        if (nodep->isIO() && !nodep->isIfaceRef()) {
+            if (VN_IS(nodep->dtypep()->skipRefp(), UnpackArrayDType)) {
+                nodep->v3warn(UNPACKED, "Unsupported: Unpacked array on port "
+                                            << nodep->prettyNameQ()
+                                            << "; synthesis may pack this");
+            }
+        }
         nodep->didWidth(true);
         nodep->doingWidth(false);
     }
