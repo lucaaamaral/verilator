@@ -715,14 +715,17 @@ class TristateVisitor final : public TristateBaseVisitor {
             if (!m_tgraph.isTristate(varp)) continue;
             const auto it = m_lhsmap.find(varp);
             if (it != m_lhsmap.end()) continue;
-            // This variable is floating, set output enable to
-            // always be off on this assign
+            // This variable is floating, set output enable to always be off on this assign.
+            // For pullup/pulldown vars, use pull value with en=0 - the final resolution will
+            // apply the pull formula: final = (driven_value & en) | (~en & pull_value)
             UINFO(8, "  Adding driver to var " << varp);
-            AstConst* const constp = newAllZerosOrOnes(varp, false);
+            const AstPull* const pullp = m_varAux(varp).pullp;
+            const bool pullValue = pullp && pullp->direction() == 1;
+            AstConst* const constp = newAllZerosOrOnes(varp, pullValue);
             AstVarRef* const varrefp = new AstVarRef{varp->fileline(), varp, VAccess::WRITE};
             AstAssignW* const newp = new AstAssignW{varp->fileline(), varrefp, constp};
             UINFO(9, "       newoev " << newp);
-            varrefp->user1p(newAllZerosOrOnes(varp, false));
+            varrefp->user1p(newAllZerosOrOnes(varp, false));  // en=0 for floating/pullup vars
             nodep->addStmtsp(new AstAlways{newp});
             mapInsertLhsVarRef(varrefp);  // insertTristates will convert
             //                               // to a varref to the __out# variable
@@ -1042,41 +1045,40 @@ class TristateVisitor final : public TristateBaseVisitor {
             return;
         }
 
-        if (!outvarp) {
-            // This is the final pre-forced resolution of the tristate, so we apply
-            // the pull direction to any undriven pins.
+        // Apply pull formula: final = orp | (~enp & pull_value)
+        // Always run at top level (!outvarp) so that the strength-enable expression (enp)
+        // is consumed into orp even when no pull is present; pull_value is then all-zeros
+        // so this is semantically a no-op but it links enp into the tree.
+        // Also run at intermediate levels when there's a pull, so the pull is baked into
+        // the contribution flowing up the hierarchy.
+        const bool hasPull = m_varAux(lhsp).pullp || hasPerBitPulls(lhsp);
+        if (!outvarp || hasPull) {
             AstNodeExpr* undrivenp;
-            UINFO(4, "Final resolution: envarp=" << (envarp ? envarp->name() : "null")
-                                                 << " enp=" << (enp ? "set" : "null")
-                                                 << " orp=" << (orp ? "set" : "null") << endl);
             if (envarp) {
                 undrivenp = new AstNot{envarp->fileline(),
                                        new AstVarRef{envarp->fileline(), envarp, VAccess::READ}};
+            } else if (enp) {
+                undrivenp = new AstNot{enp->fileline(), enp};
+                enp = nullptr;  // moved into undrivenp
             } else {
-                if (enp) {
-                    undrivenp = new AstNot{enp->fileline(), enp};
-                } else {
-                    undrivenp = newAllZerosOrOnes(invarp, true);
-                }
+                undrivenp = newAllZerosOrOnes(invarp, true);
             }
 
-            // Generate pull constant: use per-bit pulls if available, else whole-var pull
             AstConst* pullConstp;
-            UINFO(4, "Resolution for " << lhsp->name()
-                                       << " hasPerBitPulls=" << hasPerBitPulls(lhsp)
-                                       << " outvarp=" << (outvarp ? "set" : "null") << endl);
             if (hasPerBitPulls(lhsp)) {
                 pullConstp = createPerBitPullConst(lhsp);
-                UINFO(4, "using per-bit pull const for " << lhsp->name() << endl);
             } else {
                 const AstPull* const pullp = m_varAux(lhsp).pullp;
-                const bool pull1 = pullp && pullp->direction() == 1;  // Else default is down
+                const bool pull1 = pullp && pullp->direction() == 1;
                 pullConstp = newAllZerosOrOnes(invarp, pull1);
             }
 
             undrivenp = new AstAnd{invarp->fileline(), undrivenp, pullConstp};
-            orp = new AstOr{invarp->fileline(), orp, undrivenp};
+            orp = orp ? new AstOr{invarp->fileline(), orp, undrivenp} : undrivenp;
         }
+
+        // Ensure enp is valid when envarp exists (pullup/pulldown only = no active driver)
+        if (envarp && !enp) { enp = newAllZerosOrOnes(invarp, false); }
 
         if (envarp) {
             AstAssignW* const enAssp = new AstAssignW{
@@ -1590,10 +1592,27 @@ class TristateVisitor final : public TristateBaseVisitor {
                 UINFO(9, "   enp<-rhs " << nodep->lhsp()->user1p());
                 m_tgraph.didProcess(nodep);
             } else {
-                // Non-tristate assignment - just mark as processed.
-                // Don't set user1p here as there are no handlers for many LHS node types
-                // (ArraySel, MemberSel, StructSel, etc.) and checkUnhandled() would error.
-                m_tgraph.didProcess(nodep, true);
+                // Non-tristate RHS. For SEL assigns to tristate variables, we still
+                // need to track which bits are driven by creating a proper enable.
+                if (AstSel* const selp = VN_CAST(nodep->lhsp(), Sel)) {
+                    if (AstNodeVarRef* const varrefp = VN_CAST(selp->fromp(), NodeVarRef)) {
+                        if (m_tgraph.isTristate(varrefp->varp())) {
+                            // Create an all-1s enable for the SEL width - this will be
+                            // deposited into the correct bit positions by newEnableDeposit
+                            nodep->lhsp()->user1p(newAllZerosOrOnes(nodep->lhsp(), true));
+                            UINFO(9, "   enp<-nonTri SEL " << nodep->lhsp()->user1p());
+                            m_tgraph.didProcess(nodep);
+                        } else {
+                            m_tgraph.didProcess(nodep, true);
+                        }
+                    } else {
+                        m_tgraph.didProcess(nodep, true);
+                    }
+                } else {
+                    // Don't set user1p here as there are no handlers for many LHS node types
+                    // (ArraySel, MemberSel, StructSel, etc.) and checkUnhandled() would error.
+                    m_tgraph.didProcess(nodep, true);
+                }
             }
             m_alhs = true;  // And user1p() will indicate tristate equation, if any
             if (AstAssignW* const assignWp = VN_CAST(nodep, AssignW)) {
@@ -2335,7 +2354,8 @@ class TristateVisitor final : public TristateBaseVisitor {
 
             AstNodeExpr* undrivenp = new AstNot{fl, new AstVarRef{fl, envarp, VAccess::READ}};
             undrivenp = new AstAnd{fl, undrivenp, pullConstp};
-            orp = new AstOr{fl, orp, undrivenp};
+            // Handle case where there are no other drivers (only pullup/pulldown)
+            orp = orp ? new AstOr{fl, orp, undrivenp} : undrivenp;
 
             // Assign final value to invarp
             AstAssignW* const assp
